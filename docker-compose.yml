@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: consult
+      POSTGRES_PASSWORD: consult
+      POSTGRES_DB: consult
+    ports:
+      - "5432:5432"
+    volumes:
+      - consult_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U consult -d consult"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://consult:consult@db:5432/consult
+      JWT_SECRET_KEY: dev-only-secret-change-in-production
+      CORS_ALLOW_ORIGINS: '["http://localhost:5173"]'
+      # Real AI features need real keys, set in your shell or a .env
+      # file next to this compose file (see README's "Getting the real
+      # AI working" section). Without them, everything up through claim
+      # review/approval/dispatch still works against seeded data; only
+      # live transcription/extraction will fail, cleanly, with a
+      # specific error message rather than a crash.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  consult_pgdata:
