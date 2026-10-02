@@ -38,8 +38,9 @@ README's "Getting the real AI working" section for exact steps.
 import re
 from pathlib import Path
 
-import httpx
-from anthropic import Anthropic
+import json
+from ollama import AsyncClient
+from faster_whisper import WhisperModel
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -47,8 +48,7 @@ from app.models.consultation import AIClaim, ClaimCategory, Consultation, Consul
 
 settings = get_settings()
 
-OPENAI_TRANSCRIPTION_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
-
+OLLAMA_MODEL = "qwen3:4b-instruct"
 # --- PII redaction -----------------------------------------------------
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -78,34 +78,40 @@ def redact_pii(text: str) -> str:
 # --- Speech-to-text (OpenAI Whisper) ------------------------------------
 
 
-async def transcribe_audio(audio_path: str) -> list[dict]:
+def transcribe_audio(audio_path: str) -> list[dict]:
     """
-    Calls OpenAI's Whisper transcription API and returns a list of
-    {speaker, text, start_offset_seconds} dicts, one per Whisper
-    "segment" (roughly a phrase/sentence, with a timestamp).
+    Transcribe audio locally using faster-whisper.
 
-    Every entry has speaker="dictation" — Whisper has no diarization, so
-    this pipeline doesn't fabricate a doctor/patient split. See the
-    module docstring for what a real fix would involve.
-
-    Raises RuntimeError if no API key is configured, or
-    httpx.HTTPStatusError if OpenAI's API returns an error.
+    No external API call or API key is required.
+    Returns timestamped transcript segments in the same format
+    expected by the rest of the pipeline.
     """
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured — set it in .env to enable transcription.")
+    model = WhisperModel(
+        "base",
+        device="cpu",
+        compute_type="int8",
+    )
 
-    audio_bytes = Path(audio_path).read_bytes()
-    filename = Path(audio_path).name or "audio.webm"
+    segments, info = model.transcribe(
+        audio_path,
+        beam_size=5,
+    )
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(
-            OPENAI_TRANSCRIPTION_ENDPOINT,
-            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-            files={"file": (filename, audio_bytes, "application/octet-stream")},
-            data={"model": "whisper-1", "response_format": "verbose_json"},
-        )
-    resp.raise_for_status()
-    return _parse_whisper_response(resp.json())
+    utterances = []
+
+    for segment in segments:
+        text = segment.text.strip()
+
+        if text:
+            utterances.append(
+                {
+                    "speaker": "dictation",
+                    "text": text,
+                    "start_offset_seconds": segment.start,
+                }
+            )
+
+    return utterances
 
 
 def _parse_whisper_response(data: dict) -> list[dict]:
@@ -136,7 +142,7 @@ def _parse_whisper_response(data: dict) -> list[dict]:
 
 # --- LLM claim extraction -----------------------------------------------
 
-_CLAIM_TOOL = {
+_CLAIM_SCHEMA = {
     "name": "record_clinical_claims",
     "description": "Record structured clinical claims extracted from a consultation transcript, each grounded in specific transcript line numbers.",
     "input_schema": {
@@ -188,67 +194,98 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _get_anthropic_client() -> Anthropic:
-    if not settings.anthropic_api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not configured — set it in .env to enable claim extraction.")
-    return Anthropic(api_key=settings.anthropic_api_key)
 
 
 async def extract_claims(transcript_lines: list[TranscriptLine]) -> list[dict]:
     """
-    Calls the Anthropic API to extract structured clinical claims from the
-    transcript, each grounded in specific transcript line ids (PID Section
-    7.3). PII is redacted from every line before it's sent (Section 7.1).
+    Extract structured clinical claims using a local Ollama model.
 
-    Returns a list of {category, text, requires_verification,
-    source_line_ids} dicts — source_line_ids are the real TranscriptLine
-    UUIDs, already mapped back from the model's line-number citations.
-    Claims whose citations don't resolve to any real line are dropped
-    rather than silently persisted ungrounded.
+    No external API or API key is required. The model runs locally
+    through Ollama at localhost.
     """
-    client = _get_anthropic_client()
-
     line_id_by_index: dict[int, object] = {}
     numbered_lines = []
+
     for i, line in enumerate(transcript_lines):
         line_id_by_index[i] = line.id
         numbered_lines.append(f"[{i}] {redact_pii(line.text)}")
+
     transcript_text = "\n".join(numbered_lines)
 
-    response = client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=2000,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Transcript:\n{transcript_text}"}],
-        tools=[_CLAIM_TOOL],
-        tool_choice={"type": "tool", "name": "record_clinical_claims"},
+    prompt = f"""
+{_SYSTEM_PROMPT}
+
+Transcript:
+{transcript_text}
+
+Return ONLY the structured JSON object matching the required schema.
+Do not include markdown fences.
+"""
+
+    client = AsyncClient()
+
+    response = await client.chat(
+        model=OLLAMA_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        format=_CLAIM_SCHEMA["input_schema"],
+        options={
+            "temperature": 0,
+        },
     )
 
-    return _parse_claim_response(response, line_id_by_index)
+    return _parse_claim_response(
+        response.message.content,
+        line_id_by_index,
+    )
 
 
-def _parse_claim_response(response, line_id_by_index: dict[int, object]) -> list[dict]:
-    """Pulled out of extract_claims so it's directly unit-testable against
-    a canned Anthropic response object, with no network call."""
-    tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
-    if tool_use_block is None:
-        raise RuntimeError("Model did not return structured claims (no tool_use block in response).")
+def _parse_claim_response(
+    response_content: str,
+    line_id_by_index: dict[int, object],
+) -> list[dict]:
+    """
+    Parse the JSON returned by Ollama and map transcript line numbers
+    back to the real TranscriptLine UUIDs.
+    """
+    try:
+        data = json.loads(response_content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Local model returned invalid JSON: {exc}"
+        ) from exc
 
-    raw_claims = tool_use_block.input.get("claims", [])
+    raw_claims = data.get("claims", [])
 
     claims = []
+
     for c in raw_claims:
-        source_ids = [line_id_by_index[i] for i in c.get("source_line_indices", []) if i in line_id_by_index]
+        source_ids = [
+            line_id_by_index[i]
+            for i in c.get("source_line_indices", [])
+            if i in line_id_by_index
+        ]
+
+        # Never persist an ungrounded claim.
         if not source_ids:
-            continue  # ungrounded claim — drop it rather than let it through
+            continue
+
         claims.append(
             {
                 "category": c["category"],
                 "text": c["text"],
-                "requires_verification": c.get("requires_verification", False),
+                "requires_verification": c.get(
+                    "requires_verification",
+                    False,
+                ),
                 "source_line_ids": source_ids,
             }
         )
+
     return claims
 
 
@@ -265,7 +302,7 @@ async def transcribe_and_extract(db: Session, consultation: Consultation) -> Non
     API route) can return a real error to the client.
     """
     try:
-        utterances = await transcribe_audio(consultation.audio_storage_url)
+        utterances = transcribe_audio(consultation.audio_storage_url)
 
         for i, u in enumerate(utterances):
             db.add(
